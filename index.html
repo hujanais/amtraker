@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amtrak Tracker</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root { height: 100%; }
+  body { overflow: hidden; }
+  .train-marker { background: none !important; border: none !important; }
+  .leaflet-control-attribution {
+    font-size: 9px !important; background: rgba(0,0,0,0.55) !important;
+    color: #666 !important; padding: 2px 6px !important;
+  }
+  .leaflet-control-attribution a { color: #888 !important; }
+  .leaflet-control-zoom a {
+    background: rgba(15,20,32,0.9) !important;
+    color: #aaa !important; border-color: #2a3550 !important;
+  }
+  .leaflet-control-zoom a:hover { background: rgba(30,42,64,0.9) !important; color: #fff !important; }
+  ::-webkit-scrollbar { width: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+  input::placeholder { opacity: 0.35; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+    50% { box-shadow: 0 0 0 5px transparent; opacity: 0.7; }
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .fade-in { animation: fadeIn 0.25s ease forwards; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ── THEMES ─────────────────────────────────────────────────────────────── */
+const THEMES = {
+  dark: {
+    id: 'dark', label: 'Dark',
+    bg: '#080c14', surface: '#0d1220', elevated: '#131b2e', border: '#1c2740',
+    accent: '#4f8eff', accentDim: 'rgba(79,142,255,0.12)',
+    text: '#dce4f5', sub: '#4a5a78', muted: '#1c2740',
+    ok: '#2dd68c', warn: '#f5a623', err: '#ef5454',
+    font: "'Space Grotesk', system-ui, sans-serif",
+    mono: "'JetBrains Mono', monospace",
+    up: false, br: '6px',
+    tile: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  },
+  orange: {
+    id: 'orange', label: '◈ Retro',
+    bg: '#0d0700', surface: '#180d00', elevated: '#241400', border: '#552500',
+    accent: '#ff7c00', accentDim: 'rgba(255,124,0,0.14)',
+    text: '#ffc97a', sub: '#6e380c', muted: '#381800',
+    ok: '#ffbb00', warn: '#ff7c00', err: '#ff2a00',
+    font: "'JetBrains Mono', monospace",
+    mono: "'JetBrains Mono', monospace",
+    up: false, br: '2px',
+    tile: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  },
+  green: {
+    id: 'green', label: '◈ Phosphor',
+    bg: '#000f00', surface: '#001700', elevated: '#002100', border: '#003a00',
+    accent: '#00ff41', accentDim: 'rgba(0,255,65,0.1)',
+    text: '#00e035', sub: '#006022', muted: '#002600',
+    ok: '#00ff41', warn: '#88ff00', err: '#ff4400',
+    font: "'JetBrains Mono', monospace",
+    mono: "'JetBrains Mono', monospace",
+    up: false, br: '2px',
+    tile: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  },
+  dos: {
+    id: 'dos', label: '◈ DOS',
+    bg: '#000080', surface: '#0000aa', elevated: '#0000c8', border: '#4444cc',
+    accent: '#ffff55', accentDim: 'rgba(255,255,85,0.18)',
+    text: '#ffffff', sub: '#aaaaaa', muted: '#000060',
+    ok: '#55ff55', warn: '#ffff55', err: '#ff5555',
+    font: "'Courier New', monospace",
+    mono: "'Courier New', monospace",
+    up: true, br: '0px',
+    tile: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  },
+};
+
+const RATES = [5, 10, 15];
+const API   = 'https://api-v3.amtraker.com/v3';
+const HDEG  = { N:0, NE:45, E:90, SE:135, S:180, SW:225, W:270, NW:315 };
+
+/* ── UTILS ──────────────────────────────────────────────────────────────── */
+const u = (T, s) => (T.up && typeof s === 'string') ? s.toUpperCase() : s;
+
+function fmtTime(ts, tz) {
+  if (!ts) return '——';
+  try {
+    return new Date(ts).toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit', hour12: true, timeZone: tz || undefined,
+    });
+  } catch { return '——'; }
+}
+
+function delayMins(actual, sched) {
+  if (!actual || !sched) return null;
+  return Math.round((new Date(actual) - new Date(sched)) / 60000);
+}
+
+function fmtCountdown(sec) {
+  const m = String(Math.floor(Math.max(0, sec) / 60)).padStart(2,'0');
+  const s = String(Math.max(0, sec) % 60).padStart(2,'0');
+  return `${m}:${s}`;
+}
+
+function mkIcon(T, heading) {
+  const deg = HDEG[heading] ?? 0;
+  const c = T.accent, bg = T.bg;
+  const html = `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+    <g transform="rotate(${deg},18,18)">
+      <polygon points="18,3 28,33 18,25 8,33" fill="${c}" stroke="${bg}" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="18" cy="18" r="5" fill="${bg}" stroke="${c}" stroke-width="2"/>
+    </g></svg>`;
+  return L.divIcon({ html, className:'train-marker', iconSize:[36,36], iconAnchor:[18,18] });
+}
+
+/* ── MAP ────────────────────────────────────────────────────────────────── */
+const TRAIL_MAX = 6; // how many echo positions to keep
+
+function mkGhostIcon(T, heading, opacity) {
+  const deg = HDEG[heading] ?? 0;
+  const c = T.accent, bg = T.bg;
+  // Slightly smaller than the main icon so echoes feel recessed
+  const html = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 36 36"
+    style="opacity:${opacity}">
+    <g transform="rotate(${deg},18,18)">
+      <polygon points="18,3 28,33 18,25 8,33" fill="${c}" stroke="${bg}" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="18" cy="18" r="5" fill="${bg}" stroke="${c}" stroke-width="2"/>
+    </g></svg>`;
+  return L.divIcon({ html, className:'train-marker', iconSize:[28,28], iconAnchor:[14,14] });
+}
+
+function rebuildGhosts(map, ghostsRef, trail, T) {
+  ghostsRef.current.forEach(g => g.remove());
+  ghostsRef.current = [];
+  trail.forEach((pos, i) => {
+    // oldest = most faded, newest = least faded
+    const opacity = ((i + 1) / (trail.length + 1)) * 0.52;
+    const mrk = L.marker([pos.lat, pos.lon], {
+      icon: mkGhostIcon(T, pos.heading, 1), // opacity via SVG attribute above
+      interactive: false,
+      zIndexOffset: -(trail.length - i) * 100,
+    }).addTo(map);
+    mrk.setOpacity(opacity);
+    ghostsRef.current.push(mrk);
+  });
+}
+
+function TrainMap({ lat, lon, heading, trail, theme: T }) {
+  const elRef    = useRef(null);
+  const mapRef   = useRef(null);
+  const mrkRef   = useRef(null);
+  const tilRef   = useRef(null);
+  const ghostsRef= useRef([]);
+  const hdgRef   = useRef(heading);
+  useEffect(() => { hdgRef.current = heading; }, [heading]);
+
+  // Init
+  useEffect(() => {
+    if (!elRef.current || mapRef.current) return;
+    const map = L.map(elRef.current, { zoomControl: false, attributionControl: false })
+      .setView([lat, lon], 8);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+    L.control.attribution({ prefix: false }).addTo(map);
+    const tile = L.tileLayer(T.tile, {
+      attribution: '© <a href="https://carto.com">CartoDB</a> © OpenStreetMap', maxZoom: 18,
+    }).addTo(map);
+    const mrk = L.marker([lat, lon], { icon: mkIcon(T, heading) }).addTo(map);
+    mapRef.current = map; mrkRef.current = mrk; tilRef.current = tile;
+    return () => {
+      ghostsRef.current.forEach(g => g.remove());
+      ghostsRef.current = [];
+      map.remove(); mapRef.current = null; mrkRef.current = null; tilRef.current = null;
+    };
+  }, []);
+
+  // Update main marker position
+  useEffect(() => {
+    if (!mapRef.current || !mrkRef.current) return;
+    mrkRef.current.setLatLng([lat, lon]);
+    mrkRef.current.setIcon(mkIcon(T, heading));
+    mapRef.current.panTo([lat, lon], { animate: true, duration: 1.5 });
+  }, [lat, lon, heading]);
+
+  // Rebuild ghost markers whenever trail or theme changes
+  useEffect(() => {
+    if (!mapRef.current) return;
+    rebuildGhosts(mapRef.current, ghostsRef, trail, T);
+  }, [trail, T]);
+
+  // Theme change — update main marker icon too
+  const prevId = useRef(T.id);
+  useEffect(() => {
+    if (!mapRef.current || prevId.current === T.id) return;
+    if (mrkRef.current) mrkRef.current.setIcon(mkIcon(T, hdgRef.current));
+    prevId.current = T.id;
+  }, [T]);
+
+  return <div ref={elRef} style={{ width:'100%', height:'100%' }} />;
+}
+
+/* ── STATION PANEL ──────────────────────────────────────────────────────── */
+function DelayBadge({ delay, T }) {
+  if (delay === null) return null;
+  const color = delay <= 0 ? T.ok : delay <= 15 ? T.warn : T.err;
+  const label = delay <= 0 ? (T.up ? 'ON TIME' : 'On time') : `+${delay}m`;
+  return (
+    <span style={{
+      fontSize:'9px', padding:'1px 5px', borderRadius: T.br,
+      background:`${color}18`, color, border:`1px solid ${color}44`,
+      fontFamily: T.mono, letterSpacing:'0.08em', flexShrink:0,
+    }}>{label}</span>
+  );
+}
+
+function TimeRow({ label, sched, actual, delay, tz, T }) {
+  const actual_t = actual ? fmtTime(actual, tz) : null;
+  const sched_t  = fmtTime(sched, tz);
+  return (
+    <div>
+      <div style={{ fontSize:'9px', textTransform:'uppercase', letterSpacing:'0.1em', color:T.sub, marginBottom:'2px' }}>
+        {u(T, label)}
+      </div>
+      <div style={{ fontSize:'12px', fontFamily:T.mono, color:T.text }}>{sched_t}</div>
+      {actual_t && actual_t !== sched_t && (
+        <div style={{ display:'flex', alignItems:'center', gap:'4px', marginTop:'1px' }}>
+          <span style={{ fontSize:'11px', fontFamily:T.mono, color: delay !== null && delay > 0 ? T.warn : T.ok }}>
+            {actual_t}
+          </span>
+          <DelayBadge delay={delay} T={T} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StationPanel({ stations, theme: T }) {
+  const upcoming = stations.filter(s => s.status !== 'Departed');
+  return (
+    <div style={{ height:'100%', overflowY:'auto', padding:'14px 18px', fontFamily:T.font }}>
+      <div style={{
+        fontSize:'9px', letterSpacing:'0.14em', textTransform:'uppercase',
+        color:T.sub, marginBottom:'16px', fontFamily:T.mono,
+        display:'flex', justifyContent:'space-between',
+      }}>
+        <span>{u(T,'Upcoming Stops')}</span>
+        <span>{upcoming.length} {u(T,'remaining')}</span>
+      </div>
+
+      {upcoming.length === 0 && (
+        <div style={{ color:T.sub, fontSize:'13px', textAlign:'center', paddingTop:'40px' }}>
+          {u(T,'Train has reached its destination.')}
+        </div>
+      )}
+
+      {upcoming.map((st, i) => {
+        const isCurrent = st.status === 'Station';
+        const isNext    = i === 0 && !isCurrent;
+        const highlight = isCurrent || isNext;
+        const dotColor  = isCurrent ? T.ok : isNext ? T.accent : T.border;
+        const dotSize   = highlight ? 11 : 7;
+        const arrDelay  = delayMins(st.arr, st.schArr);
+        const depDelay  = delayMins(st.dep, st.schDep);
+
+        return (
+          <div key={`${st.code}-${i}`} style={{ display:'flex', gap:'13px' }}>
+            {/* spine */}
+            <div style={{ display:'flex', flexDirection:'column', alignItems:'center', width:'12px', flexShrink:0 }}>
+              <div style={{
+                width:dotSize, height:dotSize, borderRadius:'50%',
+                background:dotColor, flexShrink:0, marginTop:'4px',
+                boxShadow: highlight ? `0 0 7px ${dotColor}88` : 'none',
+                animation: isCurrent ? 'pulseGlow 2s ease-in-out infinite' : 'none',
+                color: dotColor,
+              }} />
+              {i < upcoming.length - 1 && (
+                <div style={{ flex:1, width:'1px', background:T.border, margin:'4px 0', minHeight:'26px' }} />
+              )}
+            </div>
+
+            {/* content */}
+            <div style={{ flex:1, paddingBottom:'18px' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:'8px' }}>
+                <div>
+                  <div style={{
+                    fontSize: highlight ? '14px' : '12px',
+                    fontWeight: highlight ? 600 : 400,
+                    color: highlight ? T.text : T.sub,
+                    lineHeight:1.3,
+                  }}>
+                    {u(T, st.name)}
+                  </div>
+                  <div style={{ fontSize:'9px', color:T.sub, fontFamily:T.mono, marginTop:'1px', letterSpacing:'0.06em' }}>
+                    {st.code}{st.bus ? ' · BUS' : ''}{st.platform ? ` · PLT ${st.platform}` : ''}
+                  </div>
+                </div>
+                {isCurrent && (
+                  <span style={{
+                    fontSize:'9px', padding:'2px 7px', borderRadius:T.br,
+                    background:`${T.ok}18`, color:T.ok, border:`1px solid ${T.ok}44`,
+                    fontFamily:T.mono, letterSpacing:'0.1em', whiteSpace:'nowrap', flexShrink:0,
+                  }}>{u(T,'AT STATION')}</span>
+                )}
+                {isNext && (
+                  <span style={{
+                    fontSize:'9px', padding:'2px 7px', borderRadius:T.br,
+                    background:T.accentDim, color:T.accent, border:`1px solid ${T.accent}44`,
+                    fontFamily:T.mono, letterSpacing:'0.1em', whiteSpace:'nowrap', flexShrink:0,
+                  }}>{u(T,'NEXT')}</span>
+                )}
+              </div>
+
+              <div style={{ display:'flex', gap:'18px', marginTop:'7px', flexWrap:'wrap' }}>
+                {st.schArr && (
+                  <TimeRow label="Arr" sched={st.schArr} actual={st.arr} delay={arrDelay} tz={st.tz} T={T} />
+                )}
+                {st.schDep && (
+                  <TimeRow label="Dep" sched={st.schDep} actual={st.dep} delay={depDelay} tz={st.tz} T={T} />
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ── TRAIN BANNER ───────────────────────────────────────────────────────── */
+function Chip({ label, value, T, mono, bold, color }) {
+  return (
+    <div>
+      <div style={{ fontSize:'9px', textTransform:'uppercase', letterSpacing:'0.12em', color:T.sub, marginBottom:'1px' }}>
+        {u(T, label)}
+      </div>
+      <div style={{
+        fontSize: bold ? '14px' : '12px',
+        fontWeight: bold ? 600 : 400,
+        fontFamily: mono ? T.mono : T.font,
+        color: color || T.text,
+      }}>{u(T, value)}</div>
+    </div>
+  );
+}
+
+function Divider({ T }) {
+  return <div style={{ width:'1px', height:'28px', background:T.border, flexShrink:0 }} />;
+}
+
+function TrainBanner({ train: tr, theme: T }) {
+  return (
+    <div style={{
+      padding:'9px 18px', background:T.elevated, borderBottom:`1px solid ${T.border}`,
+      display:'flex', alignItems:'center', gap:'18px', flexShrink:0,
+      flexWrap:'wrap', minHeight:'52px',
+    }}>
+      <Chip label="Route" value={tr.routeName} bold T={T} />
+      <Divider T={T} />
+      <Chip label="Train #" value={`#${tr.trainNum}`} mono T={T} />
+      <Chip label="Speed" value={`${tr.velocity} mph`} mono T={T} />
+      <Chip label="Heading" value={tr.heading || '—'} mono T={T} />
+      <Chip label="State" value={tr.trainState} mono T={T} color={tr.trainState === 'Active' ? T.ok : T.warn} />
+      <Divider T={T} />
+      <Chip label="Origin" value={tr.origCode} mono T={T} />
+      <span style={{ color:T.sub, fontSize:'13px' }}>→</span>
+      <Chip label="Dest" value={tr.destCode} mono T={T} />
+      {tr.statusMsg && tr.statusMsg.trim() && (
+        <>
+          <Divider T={T} />
+          <div style={{ fontSize:'11px', color:T.warn, fontFamily:T.mono }}>
+            ⚠ {u(T, tr.statusMsg)}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ── EMPTY STATE ────────────────────────────────────────────────────────── */
+const EXAMPLES = ['3','5','49','91','48','7'];
+
+function EmptyState({ theme: T, onPick }) {
+  return (
+    <div style={{
+      flex:1, display:'flex', flexDirection:'column',
+      alignItems:'center', justifyContent:'center', gap:'10px', padding:'40px',
+    }}>
+      <div style={{ fontSize:'44px', lineHeight:1 }}>🚂</div>
+      <div style={{ fontSize:'17px', fontWeight:600, color:T.text, marginTop:'8px', fontFamily:T.font }}>
+        {u(T,'No train selected')}
+      </div>
+      <div style={{
+        fontSize:'12px', color:T.sub, textAlign:'center', maxWidth:'340px',
+        lineHeight:1.65, fontFamily:T.font,
+      }}>
+        {u(T,'Enter a train number above and press Track. The tracker auto-refreshes at your chosen rate.')}
+      </div>
+      <div style={{ display:'flex', gap:'7px', marginTop:'14px', flexWrap:'wrap', justifyContent:'center' }}>
+        {EXAMPLES.map(n => (
+          <button key={n} onClick={() => onPick(n)} style={{
+            padding:'5px 12px', borderRadius:T.br,
+            border:`1px solid ${T.accent}55`, color:T.accent,
+            background: T.accentDim, fontFamily:T.mono,
+            fontSize:'12px', cursor:'pointer',
+          }}>#{n}</button>
+        ))}
+      </div>
+      <div style={{ fontSize:'10px', color:T.sub, fontFamily:T.mono, marginTop:'6px', letterSpacing:'0.06em' }}>
+        {u(T,'3=SW Chief · 5=CA Zephyr · 49=Lake Shore · 91=Silver Star · 48=Lake Shore · 7=Empire Builder')}
+      </div>
+    </div>
+  );
+}
+
+/* ── APP ────────────────────────────────────────────────────────────────── */
+function App() {
+  const [themeId, setThemeId] = useState('dark');
+  const [input,   setInput]   = useState('');
+  const [rate,    setRate]    = useState(5);
+  const [train,   setTrain]   = useState(null);
+  const [trail,   setTrail]   = useState([]);   // echo positions
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState('');
+  const [lastUpd, setLastUpd] = useState(null);
+  const [cdwn,    setCdwn]    = useState(0);
+  const [multi,   setMulti]   = useState(0);
+
+  const T           = THEMES[themeId];
+  const numRef      = useRef('');
+  const ivRef       = useRef(null);
+  const timerRef    = useRef(null);
+  const rateRef     = useRef(rate);
+  const prevPosRef  = useRef(null); // last known position for trail
+  useEffect(() => { rateRef.current = rate; }, [rate]);
+
+  const doFetch = useCallback(async (num) => {
+    if (!num) return;
+    setLoading(true); setError('');
+    try {
+      const res  = await fetch(`${API}/trains/${num}`);
+      if (!res.ok) throw new Error(`API error ${res.status}`);
+      const data = await res.json();
+      const keys = Object.keys(data);
+      if (!keys.length) throw new Error('No active trains found for this number.');
+      const list = data[keys[0]];
+      if (!list?.length) throw new Error('Train not found or not currently active.');
+      const newTrain = list[0];
+
+      // Save previous position as a new echo before updating
+      if (prevPosRef.current && newTrain.lat !== 0 &&
+          (prevPosRef.current.lat !== newTrain.lat || prevPosRef.current.lon !== newTrain.lon)) {
+        const snap = { lat: prevPosRef.current.lat, lon: prevPosRef.current.lon, heading: prevPosRef.current.heading };
+        setTrail(prev => [...prev.slice(-(TRAIL_MAX - 1)), snap]);
+      }
+      prevPosRef.current = { lat: newTrain.lat, lon: newTrain.lon, heading: newTrain.heading };
+
+      setTrain(newTrain);
+      setMulti(list.length);
+      setLastUpd(new Date());
+      setCdwn(rateRef.current * 60);
+    } catch(e) { setError(e.message); }
+    finally    { setLoading(false); }
+  }, []);
+
+  const startTracking = useCallback((num) => {
+    if (!num.trim()) return;
+    numRef.current   = num.trim();
+    prevPosRef.current = null;  // reset echo history for new train
+    setTrail([]);
+    doFetch(numRef.current);
+    clearInterval(ivRef.current);
+    ivRef.current = setInterval(
+      () => doFetch(numRef.current),
+      rateRef.current * 60 * 1000
+    );
+  }, [doFetch]);
+
+  const handleTrack = () => startTracking(input);
+  const handlePick  = (n) => { setInput(n); startTracking(n); };
+
+  useEffect(() => {
+    if (!lastUpd) return;
+    setCdwn(rate * 60);
+    clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => setCdwn(c => Math.max(0, c - 1)), 1000);
+    return () => clearInterval(timerRef.current);
+  }, [lastUpd, rate]);
+
+  useEffect(() => {
+    if (!numRef.current || !train) return;
+    clearInterval(ivRef.current);
+    ivRef.current = setInterval(() => doFetch(numRef.current), rate * 60 * 1000);
+    setCdwn(rate * 60);
+  }, [rate, doFetch]);
+
+  useEffect(() => () => { clearInterval(ivRef.current); clearInterval(timerRef.current); }, []);
+
+  const btnBase = (active, sm) => ({
+    padding:    sm ? '4px 10px' : '7px 16px',
+    borderRadius: T.br || '4px',
+    border:     `1px solid ${active ? T.accent : T.border}`,
+    background: active ? T.accentDim : 'transparent',
+    color:      active ? T.accent : T.sub,
+    fontFamily: T.mono, fontSize: sm ? '11px' : '13px',
+    cursor:     'pointer', fontWeight: active ? 600 : 400,
+    letterSpacing: sm ? '0.04em' : 0,
+    transition: 'all 0.12s',
+  });
+
+  const isLocated = train && (train.lat !== 0 || train.lon !== 0);
+
+  return (
+    <div style={{
+      height:'100vh', display:'flex', flexDirection:'column',
+      background:T.bg, color:T.text, fontFamily:T.font, overflow:'hidden',
+    }}>
+      {/* ── HEADER ── */}
+      <header style={{
+        padding:'10px 18px', borderBottom:`1px solid ${T.border}`,
+        background:T.surface, flexShrink:0,
+        display:'flex', flexDirection:'column', gap:'9px',
+      }}>
+        {/* Row 1 – Logo + Themes */}
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:'10px' }}>
+            <span style={{ fontSize:'18px' }}>🚂</span>
+            <span style={{
+              fontSize:'12px', fontWeight:700, letterSpacing:'0.18em',
+              textTransform:'uppercase', color:T.accent, fontFamily:T.mono,
+            }}>Amtrak Tracker</span>
+            {T.id === 'dos' && (
+              <span style={{ fontSize:'10px', color:T.sub, fontFamily:T.mono }}>v3.0.0</span>
+            )}
+          </div>
+          <div style={{ display:'flex', gap:'5px' }}>
+            {Object.values(THEMES).map(t => (
+              <button key={t.id} onClick={() => setThemeId(t.id)} style={btnBase(t.id===themeId, true)}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Row 2 – Controls */}
+        <div style={{ display:'flex', alignItems:'center', gap:'12px', flexWrap:'wrap' }}>
+          {/* Input */}
+          <div style={{ display:'flex', gap:'7px', alignItems:'center' }}>
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleTrack()}
+              placeholder={u(T, 'Train number — e.g. 3, 5, 49')}
+              style={{
+                padding:'7px 12px', borderRadius: T.br || '4px',
+                border:`1px solid ${T.border}`, background:T.elevated,
+                color:T.text, fontFamily:T.mono, fontSize:'13px',
+                outline:'none', width:'228px',
+              }}
+            />
+            <button
+              onClick={handleTrack}
+              disabled={loading}
+              style={{
+                ...btnBase(false, false),
+                background: loading ? T.muted : T.accent,
+                color:      loading ? T.sub   : T.bg,
+                border:     `1px solid ${T.accent}`,
+                fontWeight: 700,
+                cursor:     loading ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {loading ? u(T,'···') : u(T,'Track')}
+            </button>
+          </div>
+
+          <div style={{ width:'1px', height:'26px', background:T.border }} />
+
+          {/* Rate */}
+          <div style={{ display:'flex', alignItems:'center', gap:'6px' }}>
+            <span style={{ fontSize:'10px', textTransform:'uppercase', letterSpacing:'0.1em', color:T.sub }}>
+              {u(T,'Every')}
+            </span>
+            {RATES.map(r => (
+              <button key={r} onClick={() => setRate(r)} style={btnBase(r===rate, true)}>
+                {r}m
+              </button>
+            ))}
+          </div>
+
+          {/* Status */}
+          {lastUpd && (
+            <div style={{ display:'flex', gap:'14px', marginLeft:'auto', alignItems:'center' }}>
+              {multi > 1 && (
+                <span style={{ fontSize:'10px', color:T.warn, fontFamily:T.mono }}>
+                  {u(T, `${multi} active trains found · showing first`)}
+                </span>
+              )}
+              <div style={{ fontSize:'10px', fontFamily:T.mono, color:T.sub }}>
+                <span style={{ textTransform:'uppercase', letterSpacing:'0.08em' }}>{u(T,'Updated')} </span>
+                <span style={{ color:T.text }}>{lastUpd.toLocaleTimeString()}</span>
+              </div>
+              <div style={{ fontSize:'10px', fontFamily:T.mono, color:T.sub }}>
+                <span style={{ textTransform:'uppercase', letterSpacing:'0.08em' }}>{u(T,'Next')} </span>
+                <span style={{ color: cdwn < 60 ? T.warn : T.text }}>{fmtCountdown(cdwn)}</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </header>
+
+      {/* ── CONTENT ── */}
+      <main style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
+        {/* Error banner */}
+        {error && (
+          <div style={{
+            padding:'7px 18px', background:`${T.err}18`,
+            borderBottom:`1px solid ${T.err}44`,
+            display:'flex', alignItems:'center', gap:'8px', flexShrink:0,
+          }}>
+            <span style={{ color:T.err, fontSize:'12px', fontFamily:T.mono }}>
+              {u(T, `⚠ ${error}`)}
+            </span>
+            <button onClick={() => setError('')} style={{
+              background:'none', border:'none', color:T.sub,
+              cursor:'pointer', fontSize:'15px', marginLeft:'auto', lineHeight:1,
+            }}>✕</button>
+          </div>
+        )}
+
+        {/* Loading (no train yet) */}
+        {loading && !train && (
+          <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', gap:'12px' }}>
+            <div style={{
+              width:'22px', height:'22px', borderRadius:'50%',
+              border:`2px solid ${T.border}`, borderTopColor:T.accent,
+              animation:'spin 0.75s linear infinite',
+            }}/>
+            <span style={{ color:T.sub, fontSize:'13px', fontFamily:T.mono }}>
+              {u(T,'Locating train…')}
+            </span>
+          </div>
+        )}
+
+        {/* Empty state */}
+        {!train && !loading && <EmptyState theme={T} onPick={handlePick} />}
+
+        {/* Dashboard */}
+        {train && (
+          <div className="fade-in" style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
+            <TrainBanner train={train} theme={T} />
+
+            <div style={{ flex:1, display:'flex', overflow:'hidden', minHeight:0 }}>
+              {/* Map */}
+              <div style={{ flex:'0 0 60%', position:'relative', minHeight:0 }}>
+                {isLocated ? (
+                  <TrainMap lat={train.lat} lon={train.lon} heading={train.heading} trail={trail} theme={T} />
+                ) : (
+                  <div style={{
+                    width:'100%', height:'100%', display:'flex',
+                    alignItems:'center', justifyContent:'center',
+                    flexDirection:'column', gap:'10px',
+                  }}>
+                    <div style={{ fontSize:'36px' }}>📡</div>
+                    <div style={{ color:T.sub, fontFamily:T.mono, fontSize:'12px' }}>
+                      {u(T,'Awaiting GPS signal… (train may be pre-departure)')}
+                    </div>
+                  </div>
+                )}
+                {/* Loading overlay for refreshes */}
+                {loading && train && (
+                  <div style={{
+                    position:'absolute', top:'10px', right:'10px',
+                    background:`${T.surface}cc`, borderRadius:T.br,
+                    padding:'5px 10px', border:`1px solid ${T.border}`,
+                    display:'flex', alignItems:'center', gap:'6px',
+                  }}>
+                    <div style={{
+                      width:'12px', height:'12px', borderRadius:'50%',
+                      border:`1.5px solid ${T.border}`, borderTopColor:T.accent,
+                      animation:'spin 0.75s linear infinite',
+                    }}/>
+                    <span style={{ fontSize:'10px', color:T.sub, fontFamily:T.mono }}>
+                      {u(T,'Refreshing…')}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* Station panel */}
+              <div style={{
+                flex:'0 0 40%', borderLeft:`1px solid ${T.border}`,
+                overflow:'hidden', display:'flex', flexDirection:'column', minHeight:0,
+              }}>
+                <StationPanel stations={train.stations || []} theme={T} />
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById('root'));
+</script>
+</body>
+</html>
